@@ -3,3 +3,5 @@ apiVersion: storage.k8s.io/v1beta1
 metadata:
   name: example-hostpath
 provisioner: coreos.com/hostpath-dynamic
+parameters:
+  maxVolumesPerHost: 5

@@ -19,10 +19,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"os"
-	"path"
-	"time"
-
 	"github.com/golang/glog"
 	"github.com/kubernetes-incubator/external-storage/lib/controller"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,7 +26,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/pkg/api/v1"
 	"k8s.io/client-go/rest"
+	"os"
+	"path"
+	"strconv"
 	"syscall"
+	"time"
 )
 
 const (
@@ -38,12 +38,13 @@ const (
 	provisionerName           = "coreos.com/hostpath-provisioner"
 	identityKey               = "hostPathProvisionerIdentity"
 	exponentialBackOffOnError = false
-	failedRetryThreshold      = 5
+	failedRetryThreshold      = 60
 	leasePeriod               = controller.DefaultLeaseDuration
-	retryPeriod               = controller.DefaultRetryPeriod
+	retryPeriod               = 1 * time.Second
 	renewDeadline             = controller.DefaultRenewDeadline
 	termLimit                 = controller.DefaultTermLimit
 	storageClassAnno          = "volume.beta.kubernetes.io/storage-class"
+	pvMaxClassField           = "maxVolumesPerHost"
 )
 
 type hostPathProvisioner struct {
@@ -62,6 +63,8 @@ type hostPathProvisioner struct {
 	// Either Recycle, Delete, or Retain
 	// https://godoc.org/k8s.io/api/core/v1#PersistentVolumeReclaimPolicy
 	reclaimPolicy v1.PersistentVolumeReclaimPolicy
+
+	clientSet *kubernetes.Clientset
 }
 
 var _ controller.Provisioner = &hostPathProvisioner{}
@@ -71,13 +74,6 @@ func (p *hostPathProvisioner) Provision(options controller.VolumeOptions) (*v1.P
 	if options.PVName == "" {
 		return nil, fmt.Errorf("VolumeOptions.PVName is not set")
 	}
-
-	localPath := path.Join(p.pvDir, options.PVName)
-	if err := os.MkdirAll(localPath, 0777); err != nil {
-		return nil, err
-	}
-	pvPath := path.Join(p.pvHostpathDir, options.PVName)
-	glog.Infof("-> Backing pv/%s with host directory %s", options.PVName, p.pvHostpathDir)
 
 	labels := map[string]string{}
 	if err := setSchedulerLabels(p.identity, labels); err != nil {
@@ -90,6 +86,47 @@ func (p *hostPathProvisioner) Provision(options controller.VolumeOptions) (*v1.P
 	} else {
 		storageClass = options.PVC.Annotations[storageClassAnno]
 	}
+
+	if options.Parameters == nil || options.Parameters[pvMaxClassField] == "" {
+		return nil, fmt.Errorf("storage class %s must include '%s' parameter", storageClass, pvMaxClassField)
+	}
+
+	pvMaxCount, err := strconv.Atoi(options.Parameters[pvMaxClassField])
+	if err != nil || pvMaxCount <= 0 {
+		return nil, fmt.Errorf("storage class %s parameter %s must be a positive integer: %v", storageClass, pvMaxClassField, err)
+	}
+
+	labels[storageClassAnno] = storageClass
+
+	labelSelector := &metav1.LabelSelector{
+		MatchLabels: labels,
+	}
+
+	pvList, err := p.clientSet.Core().PersistentVolumes().List(metav1.ListOptions{
+		LabelSelector: metav1.FormatLabelSelector(labelSelector),
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("error listing existing persistent volumes: %v", err)
+	}
+
+	pvCount := len(pvList.Items)
+	glog.Infof("-> Found %d existing Persistent Volumes for storage class %s", pvCount, storageClass)
+
+	if pvCount >= pvMaxCount {
+		return nil, fmt.Errorf("provisioner %s has reached max PV count (%d of %d) for storage class %s",
+			p.identity,
+			pvCount,
+			pvMaxCount,
+			storageClass)
+	}
+
+	localPath := path.Join(p.pvDir, options.PVName)
+	if err := os.MkdirAll(localPath, 0777); err != nil {
+		return nil, err
+	}
+	pvPath := path.Join(p.pvHostpathDir, options.PVName)
+	glog.Infof("-> Backing pv/%s with host directory %s", options.PVName, p.pvHostpathDir)
 
 	pv := &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
@@ -249,6 +286,7 @@ func main() {
 		pvHostpathDir: pvHostpathDir,
 		identity:      nodeName,
 		reclaimPolicy: reclaimPolicy,
+		clientSet:     clientset,
 	}
 
 	// Start the provision controller which will dynamically provision hostPath
